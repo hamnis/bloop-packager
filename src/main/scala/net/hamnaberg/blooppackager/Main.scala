@@ -1,50 +1,91 @@
 package net.hamnaberg.blooppackager
 
+import bloop.config.Config.Platform
 import cats.syntax.all._
 import bloop.config.{Config, ConfigCodecs, PlatformFiles, Tag}
+import com.monovore.decline._
 
+import java.nio.charset.StandardCharsets
 import java.nio.file.attribute.FileTime
-import java.nio.file.{Files, LinkOption, Path, StandardCopyOption, StandardOpenOption}
+import java.nio.file.{Files, LinkOption, Path, Paths, StandardCopyOption, StandardOpenOption}
 import java.util.jar.{Attributes, JarOutputStream, Manifest}
 import java.util.stream.Collectors
 import java.util.zip.ZipEntry
 import scala.jdk.CollectionConverters._
+import scala.jdk.OptionConverters._
+import scala.math.Ordered.orderingToOrdered
 import scala.util.Using
 
-import org.rogach.scallop._
-
 object Main {
-  private val epochTime = FileTime.fromMillis(0)
-
-  class Config(arguments: Seq[String]) extends ScallopConf(arguments) {
-    val config = opt[Path](default = Some(PlatformFiles.userDir.resolve(".bloop")))
-    val project = opt[String](default = Some("all"))
-    object dist extends Subcommand("dist") {
-      val path = opt[Path]()
-    }
-    addSubcommand(dist)
-    verify()
-  }
+  private val mainCmd = Command(name = "bloop-packager", "Bloop Packager", helpFlag = true)(
+    Commands.appCmd
+  )
 
   def main(args: Array[String]): Unit = {
-    val conf = new Config(args.toSeq)
+    val arguments = PlatformApp.ambientArgs.getOrElse(args.toList)
+    val parsed = mainCmd.parse(arguments, sys.env).map { case (global, cmd) =>
+      App.run(global, cmd)
+    }
+    parsed match {
+      case Left(value) =>
+        Console.err.println(value)
+        sys.exit(1)
+      case Right(_) => ()
+    }
+  }
+}
 
-    val bloop = conf.config()
+object Commands {
+  private val defaultDir = PlatformFiles.userDir.resolve(".bloop")
+
+  case class GlobalOpts(config: Path)
+
+  sealed trait Cmd {
+    def project: Option[String]
+  }
+
+  case class Jar(project: Option[String]) extends Cmd
+  case class Dist(project: Option[String], path: Option[Path]) extends Cmd
+
+  val config = Opts
+    .option[Path]("config", "directory of bloop configuration, defaults to $PWD/.bloop")
+    .withDefault(defaultDir)
+
+  val projectOpt = Opts
+    .option[String]("project", "Select which bloop project to build, default all")
+    .orNone
+
+  val jarCommand = Command[Cmd]("jar", "Package up a jar from compiled classes and resources") {
+    projectOpt.map(projectOpt => Jar(projectOpt))
+  }
+  val distCommand = Command[Cmd](
+    "dist",
+    "execute jar transitively, and locate all jar dependencies, put all the dependencies in a lib directory specified at") {
+    (projectOpt, Opts.option[Path]("path", "Path to where to put ").orNone)
+      .mapN((projectOpt, pathOpt) => Dist(projectOpt, pathOpt))
+  }
+
+  val appCmd = (config.map(GlobalOpts.apply), Opts.subcommands(distCommand, jarCommand)).tupled
+}
+
+object App {
+  private val epochTime = FileTime.fromMillis(0)
+
+  def run(global: Commands.GlobalOpts, cmd: Commands.Cmd) = {
+    if (!Files.exists(global.config)) {
+      Console.println(s"${global.config} does not exist")
+      sys.exit(1)
+    }
     val projectFiles = Files
-      .list(bloop)
+      .list(global.config)
       .filter(_.toString.endsWith(".json"))
       .collect(Collectors.toList[Path])
       .asScala
       .toList
     projectFiles.traverse(p => ConfigCodecs.read(p)) match {
       case Left(err) => throw err
-      case Right(projects) =>
-        val filtered = conf.project() match {
-          case "all" => projects
-          case name => projects.find(_.project.name == name).toList
-        }
-
-        filtered
+      case Right(parsedProjects) =>
+        val candidates = parsedProjects
           .flatMap {
             case p if p.project.tags.getOrElse(Nil).contains(Tag.Library) =>
               p.project.platform match {
@@ -53,35 +94,57 @@ object Main {
               }
             case _ => Nil
           }
+
+        val filtered = cmd.project match {
+          case Some(name) => candidates.find(_._1.name == name).toList
+          case None => candidates
+        }
+
+        val dependencyLookup = candidates.map(t => t._1.classesDir -> t).toMap
+
+        filtered
           .foreach { case (project, platform) =>
-            if (conf.subcommand.contains(conf.dist)) {
-              val distDir = conf.dist.path.getOrElse(project.out)
-              Files.createDirectories(distDir)
-              val lib = distDir.resolve("lib")
-              if (Files.exists(lib)) {
-                Files.walk(lib).forEach { p =>
-                  if (Files.isRegularFile(p)) {
-                    Files.deleteIfExists(p)
+            cmd match {
+              case Commands.Jar(_) =>
+                jar(project, platform)
+                ()
+              case Commands.Dist(_, distPath) =>
+                val distDir = distPath.map(_.resolve(project.name)).getOrElse(project.out)
+                Files.createDirectories(distDir)
+                val lib = distDir.resolve("lib")
+                if (Files.exists(lib)) {
+                  Files.walk(lib).forEach { p =>
+                    if (Files.isRegularFile(p)) {
+                      Files.deleteIfExists(p)
+                    }
+                  }
+                  if (Files.isDirectory(lib)) {
+                    Files.deleteIfExists(lib)
                   }
                 }
-                if (Files.isDirectory(lib)) {
-                  Files.deleteIfExists(lib)
+                Files.createDirectories(lib)
+
+                val jarFiles = dependenciesFor(project, platform, dependencyLookup).distinct
+
+                jarFiles.foreach { src =>
+                  Files.copy(src, lib.resolve(src.getFileName), StandardCopyOption.COPY_ATTRIBUTES)
                 }
-              }
-              Files.createDirectories(lib)
-
-              val jarFile = lib.resolve(s"${project.name}-jvm.jar")
-              jar(project, platform, jarFile)
-
-              project.classpath.filter(Files.isRegularFile(_)).foreach { src =>
-                Files.copy(src, lib.resolve(src.getFileName), StandardCopyOption.COPY_ATTRIBUTES)
-              }
-            } else {
-              val jarFile = project.out.resolve(s"${project.name}-jvm.jar")
-              jar(project, platform, jarFile)
             }
           }
     }
+  }
+
+  def dependenciesFor(
+      project: Config.Project,
+      platform: Config.Platform.Jvm,
+      lookup: Map[Path, (Config.Project, Config.Platform.Jvm)]): List[Path] = {
+    val (dirs, jars) = project.classpath.partition(Files.isDirectory(_))
+    val mayBeJar = jar(project, platform)
+    mayBeJar.toList ::: jars ::: dirs
+      .flatMap(dir => lookup.get(dir).toList)
+      .flatMap { case (dependantProject, platform) =>
+        dependenciesFor(dependantProject, platform, lookup)
+      }
   }
 
   def buildManifest(project: Config.Project, platform: Config.Platform.Jvm) = {
@@ -92,11 +155,53 @@ object Main {
     manifest
   }
 
-  def jar(project: Config.Project, platform: Config.Platform.Jvm, file: PlatformFiles.Path) = {
-    val classes = project.out.resolve("bloop-bsp-clients-classes/classes-bloop-cli")
-    if (Files.notExists(classes)) {
-      throw new RuntimeException("You need to run bloop compile before running this")
+  def jar(project: Config.Project, platform: Config.Platform.Jvm) = {
+    val jarFile = project.out.resolve(s"${project.name}-jvm.jar")
+    val internal = project.out.resolve("bloop-internal-classes")
+    if (Files.exists(internal)) {
+      val previousPath = project.out.resolve(".previous-classes-directory")
+      val resources = project.resources.getOrElse(Nil)
+      val resourceLastChange: Option[FileTime] = resources
+        .filter(Files.exists(_))
+        .flatMap(p =>
+          Files
+            .walk(p)
+            .filter(Files.isRegularFile(_))
+            .map(file => Files.getLastModifiedTime(file, LinkOption.NOFOLLOW_LINKS))
+            .collect(Collectors.toList[FileTime])
+            .asScala
+            .maxOption)
+        .maxOption
+
+      val previous =
+        Option.when(Files.exists(previousPath))(Files.readString(previousPath)).map(Paths.get(_))
+      val classesDir =
+        Files.list(internal).filter(_.toString.startsWith("classes-bloop-cli")).findFirst().toScala
+
+      classesDir.foreach { classes =>
+        if (!previous.contains(classes)) {
+          Files.writeString(
+            previousPath,
+            classes.toString,
+            StandardCharsets.UTF_8,
+            StandardOpenOption.WRITE,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.TRUNCATE_EXISTING)
+          buildJar(project, platform, jarFile, classes)
+        } else if (Files.exists(jarFile) && resourceLastChange.exists(change =>
+            change > Files.getLastModifiedTime(jarFile))) {
+          buildJar(project, platform, jarFile, classes)
+        }
+      }
     }
+    Option.when(Files.exists(jarFile))(jarFile)
+  }
+
+  private def buildJar(
+      project: Config.Project,
+      platform: Platform.Jvm,
+      file: Path,
+      classes: Path) = {
     val resourceDirectories = project.resources.getOrElse(Nil)
     if (Files.deleteIfExists(file)) {
       Console.err.println(s"Deleted existing $file")
