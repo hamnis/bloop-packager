@@ -83,7 +83,9 @@ object App {
       .asScala
       .toList
     projectFiles.traverse(p => ConfigCodecs.read(p)) match {
-      case Left(err) => throw err
+      case Left(err) =>
+        Console.err.println(s"Unable to parse bloop project files, ${err.getMessage}")
+        sys.exit(1)
       case Right(parsedProjects) =>
         val candidates = parsedProjects
           .flatMap {
