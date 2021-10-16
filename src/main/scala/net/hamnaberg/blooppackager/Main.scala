@@ -72,7 +72,7 @@ object App {
   private val epochTime = FileTime.fromMillis(0)
 
   def run(global: Commands.GlobalOpts, cmd: Commands.Cmd) = {
-    if (!Files.exists(global.config)) {
+    if (Files.notExists(global.config)) {
       Console.println(s"${global.config} does not exist")
       sys.exit(1)
     }
@@ -106,10 +106,11 @@ object App {
           .foreach { case (project, platform) =>
             cmd match {
               case Commands.Jar(_) =>
-                jar(project, platform)
-                ()
+                val maybeJar = jar(project, platform)
+                maybeJar.foreach(println)
               case Commands.Dist(_, distPath) =>
-                val distDir = distPath.map(_.resolve(project.name)).getOrElse(project.out)
+                val distDir =
+                  distPath.map(_.resolve(project.name)).getOrElse(project.out.resolve("dist"))
                 Files.createDirectories(distDir)
                 val lib = distDir.resolve("lib")
                 if (Files.exists(lib)) {
@@ -129,6 +130,7 @@ object App {
                 jarFiles.foreach { src =>
                   Files.copy(src, lib.resolve(src.getFileName), StandardCopyOption.COPY_ATTRIBUTES)
                 }
+                println(distDir)
             }
           }
     }
