@@ -5,3 +5,5 @@ libraryDependencies ++= List(
   "org.typelevel" %% "cats-core" % "2.6.1",
   "com.monovore" %% "decline" % "2.1.0"
 )
+
+enablePlugins(GitVersioning, NativeImagePlugin)
