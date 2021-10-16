@@ -5,9 +5,10 @@ import cats.syntax.all._
 import bloop.config.{Config, ConfigCodecs, PlatformFiles, Tag}
 import com.monovore.decline._
 
+import java.io.IOException
 import java.nio.charset.StandardCharsets
-import java.nio.file.attribute.FileTime
-import java.nio.file.{Files, LinkOption, Path, Paths, StandardCopyOption, StandardOpenOption}
+import java.nio.file.attribute.{BasicFileAttributes, FileTime}
+import java.nio.file._
 import java.util.jar.{Attributes, JarOutputStream, Manifest}
 import java.util.stream.Collectors
 import java.util.zip.ZipEntry
@@ -125,16 +126,7 @@ object App {
                     distPath.map(_.resolve(project.name)).getOrElse(project.out.resolve("dist"))
                   Files.createDirectories(distDir)
                   val lib = distDir.resolve("lib")
-                  if (Files.exists(lib)) {
-                    Files.walk(lib).forEach { p =>
-                      if (Files.isRegularFile(p)) {
-                        Files.deleteIfExists(p)
-                      }
-                    }
-                    if (Files.isDirectory(lib)) {
-                      Files.deleteIfExists(lib)
-                    }
-                  }
+                  deleteDirectory(lib)
                   Files.createDirectories(lib)
 
                   val jarFiles = dependenciesFor(project, platform, dependencyLookup).distinct
@@ -150,6 +142,24 @@ object App {
             }
           Code.Success
       }
+    }
+
+  private def deleteDirectory(dir: Path): Unit =
+    if (Files.exists(dir)) {
+      Files.walkFileTree(
+        dir,
+        new SimpleFileVisitor[Path] {
+          override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult = {
+            Files.deleteIfExists(file)
+            FileVisitResult.CONTINUE
+          }
+
+          override def postVisitDirectory(dir: Path, exc: IOException): FileVisitResult = {
+            Files.deleteIfExists(dir)
+            FileVisitResult.CONTINUE
+          }
+        }
+      )
     }
 
   def dependenciesFor(
@@ -173,7 +183,7 @@ object App {
     manifest
   }
 
-  def jar(project: Config.Project, platform: Config.Platform.Jvm) = {
+  def jar(project: Config.Project, platform: Config.Platform.Jvm): Option[Path] = {
     val jarFile = project.out.resolve(s"${project.name}-jvm.jar")
     val internal = project.out.resolve("bloop-internal-classes")
     if (Files.exists(internal)) {
@@ -194,10 +204,16 @@ object App {
       val previous =
         Option.when(Files.exists(previousPath))(Files.readString(previousPath)).map(Paths.get(_))
       val classesDir =
-        Files.list(internal).filter(_.toString.startsWith("classes-bloop-cli")).findFirst().toScala
+        Files
+          .list(internal)
+          .filter(_.getFileName.toString.startsWith("classes-bloop-cli"))
+          .findFirst()
+          .toScala
 
       classesDir.foreach { classes =>
-        if (!previous.contains(classes)) {
+        val nonEmptyDir = Files.list(classes).findFirst().isPresent //detect if we are empty
+
+        if (!previous.contains(classes) && nonEmptyDir) {
           Files.writeString(
             previousPath,
             classes.toString,
