@@ -3,6 +3,7 @@ package net.hamnaberg.blooppackager
 import bloop.config.Config.Platform
 import cats.syntax.all._
 import bloop.config.{Config, ConfigCodecs, PlatformFiles, Tag}
+import cats.data.NonEmptyList
 import com.monovore.decline._
 
 import java.io.IOException
@@ -17,6 +18,15 @@ import scala.jdk.OptionConverters._
 import scala.math.Ordered.orderingToOrdered
 import scala.util.Using
 
+final case class Program(name: String, mainClass: String)
+object Program {
+  private val R = "([\\w_-]+):([\\w_\\-.]+)".r
+  def parse(parse: String) = parse match {
+    case R(name, className) => Program(name, className).validNel
+    case s => s"'$s' was not a valid program definition expected to match ${R.pattern}".invalidNel
+  }
+}
+
 final case class GlobalOpts(config: Path)
 
 sealed trait Cmd {
@@ -24,7 +34,8 @@ sealed trait Cmd {
 }
 
 final case class Jar(project: Option[String]) extends Cmd
-final case class Dist(project: Option[String], path: Option[Path]) extends Cmd
+final case class Dist(project: Option[String], programs: List[Program], path: Option[Path])
+    extends Cmd
 
 sealed trait Code
 object Code {
@@ -68,14 +79,20 @@ object Commands {
     .option[String]("project", "Select which bloop project to build, default all")
     .orNone
 
+  val programOpts: Opts[List[Program]] = Opts
+    .options[String]("program", "Shell and bat scripts to generate")
+    .mapValidated(nel => nel.traverse(Program.parse))
+    .orNone
+    .map(_.map(_.toList).getOrElse(List.empty[Program]))
+
   val jarCommand = Command[Cmd]("jar", "Package up a jar from compiled classes and resources") {
     projectOpt.map(projectOpt => Jar(projectOpt))
   }
   val distCommand = Command[Cmd](
     "dist",
     "execute jar transitively, and locate all jar dependencies, put all the dependencies in a lib directory specified at") {
-    (projectOpt, Opts.option[Path]("path", "Path to where to put ").orNone)
-      .mapN((projectOpt, pathOpt) => Dist(projectOpt, pathOpt))
+    (projectOpt, programOpts, Opts.option[Path]("path", "Path to where to put ").orNone)
+      .mapN(Dist.apply)
   }
 
   val appCmd = (config.map(GlobalOpts.apply), Opts.subcommands(distCommand, jarCommand)).tupled
@@ -121,7 +138,7 @@ object App {
                 case Jar(_) =>
                   val maybeJar = jar(project, platform)
                   maybeJar.foreach(println)
-                case Dist(_, distPath) =>
+                case Dist(_, programs, distPath) =>
                   val distDir =
                     distPath.map(_.resolve(project.name)).getOrElse(project.out.resolve("dist"))
                   Files.createDirectories(distDir)
@@ -137,6 +154,13 @@ object App {
                       lib.resolve(src.getFileName),
                       StandardCopyOption.COPY_ATTRIBUTES)
                   }
+                  if (programs.nonEmpty) {
+                    val bin = distDir.resolve("bin")
+                    deleteDirectory(bin)
+                    Files.createDirectories(bin)
+                    Scripts.writeScripts(bin, "", programs)
+                  }
+
                   println(distDir)
               }
             }
