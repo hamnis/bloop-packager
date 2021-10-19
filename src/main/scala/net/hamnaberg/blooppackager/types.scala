@@ -21,9 +21,3 @@ sealed trait Cmd {
 final case class Jar(project: Option[String]) extends Cmd
 final case class Dist(project: Option[String], programs: List[Program], path: Option[Path])
     extends Cmd
-
-sealed trait Code
-object Code {
-  case object Success extends Code
-  final case class Error(message: String) extends Code
-}

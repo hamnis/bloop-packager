@@ -22,9 +22,9 @@ import scala.math.Ordered.orderingToOrdered
 object App {
   private val epochTime = FileTime.fromMillis(0)
 
-  def run(global: GlobalOpts, cmd: Cmd): Code =
+  def run(global: GlobalOpts, cmd: Cmd): Either[String, Unit] =
     if (Files.notExists(global.config)) {
-      Code.Error(s"${global.config} does not exist")
+      Left(s"${global.config} does not exist")
     } else {
       val projectFiles = Files
         .list(global.config)
@@ -34,7 +34,7 @@ object App {
         .toList
       projectFiles.traverse(p => ConfigCodecs.read(p)) match {
         case Left(err) =>
-          Code.Error(s"Unable to parse bloop project files, ${err.getMessage}")
+          Left(s"Unable to parse bloop project files, ${err.getMessage}")
         case Right(parsedProjects) =>
           val candidates = parsedProjects
             .flatMap {
@@ -85,7 +85,7 @@ object App {
                   println(distDir)
               }
             }
-          Code.Success
+          Right(())
       }
     }
 
@@ -131,20 +131,21 @@ object App {
   def jar(project: Config.Project, platform: Config.Platform.Jvm): Option[Path] = {
     val jarFile = project.out.resolve(s"${project.name}-jvm.jar")
     val internal = project.out.resolve("bloop-internal-classes")
+    val resourceLastChange: Option[FileTime] = project.resources
+      .getOrElse(Nil)
+      .filter(Files.exists(_))
+      .flatMap(p =>
+        Files
+          .walk(p)
+          .filter(Files.isRegularFile(_))
+          .map(file => Files.getLastModifiedTime(file, LinkOption.NOFOLLOW_LINKS))
+          .collect(Collectors.toList[FileTime])
+          .asScala
+          .maxOption)
+      .maxOption
+
     if (Files.exists(internal)) {
       val previousPath = project.out.resolve(".previous-classes-directory")
-      val resources = project.resources.getOrElse(Nil)
-      val resourceLastChange: Option[FileTime] = resources
-        .filter(Files.exists(_))
-        .flatMap(p =>
-          Files
-            .walk(p)
-            .filter(Files.isRegularFile(_))
-            .map(file => Files.getLastModifiedTime(file, LinkOption.NOFOLLOW_LINKS))
-            .collect(Collectors.toList[FileTime])
-            .asScala
-            .maxOption)
-        .maxOption
 
       val previous =
         Option.when(Files.exists(previousPath))(Files.readString(previousPath)).map(Paths.get(_))
