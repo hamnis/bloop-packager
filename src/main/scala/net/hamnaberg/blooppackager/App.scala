@@ -6,7 +6,6 @@ import bloop.config.{Config, ConfigCodecs, Tag}
 import cats.syntax.all._
 
 import java.io.IOException
-import java.nio.charset.StandardCharsets
 import java.nio.file._
 import java.nio.file.attribute.{BasicFileAttributes, FileTime}
 import java.util.jar.{Attributes, JarOutputStream, Manifest}
@@ -15,7 +14,6 @@ import java.util.zip.ZipEntry
 import scala.util.Using
 
 import scala.jdk.CollectionConverters._
-import scala.jdk.OptionConverters._
 
 import scala.math.Ordered.orderingToOrdered
 
@@ -129,8 +127,17 @@ object App {
   }
 
   def jar(project: Config.Project, platform: Config.Platform.Jvm): Option[Path] = {
+
     val jarFile = project.out.resolve(s"${project.name}-jvm.jar")
-    val internal = project.out.resolve("bloop-internal-classes")
+    val classes = Some(project.classesDir)
+      .filterNot(
+        Files
+          .list(_)
+          .iterator()
+          .asScala
+          .forall(p => p.toString.endsWith("bloop-internal-classes")))
+      .getOrElse(project.out.resolve("bloop-bsp-clients-classes").resolve("classes-bloop-cli"))
+    println(classes)
     val resourceLastChange: Option[FileTime] = project.resources
       .getOrElse(Nil)
       .filter(Files.exists(_))
@@ -144,36 +151,13 @@ object App {
           .maxOption)
       .maxOption
 
-    if (Files.exists(internal)) {
-      val previousPath = project.out.resolve(".previous-classes-directory")
-
-      val previous =
-        Option.when(Files.exists(previousPath))(Files.readString(previousPath)).map(Paths.get(_))
-      val classesDir =
-        Files
-          .list(internal)
-          .filter(_.getFileName.toString.startsWith("classes-bloop-cli"))
-          .findFirst()
-          .toScala
-
-      classesDir.foreach { classes =>
-        val nonEmptyDir = Files.list(classes).findFirst().isPresent //detect if we are empty
-
-        if (!previous.contains(classes) && nonEmptyDir) {
-          Files.writeString(
-            previousPath,
-            classes.toString,
-            StandardCharsets.UTF_8,
-            StandardOpenOption.WRITE,
-            StandardOpenOption.CREATE,
-            StandardOpenOption.TRUNCATE_EXISTING)
-          buildJar(project, platform, jarFile, classes)
-        } else if (Files.exists(jarFile) && resourceLastChange.exists(change =>
-            change > Files.getLastModifiedTime(jarFile))) {
-          buildJar(project, platform, jarFile, classes)
-        }
-      }
+    if (Files.exists(classes)) {
+      buildJar(project, platform, jarFile, classes)
+    } else if (Files.exists(jarFile) && resourceLastChange.exists(change =>
+        change > Files.getLastModifiedTime(jarFile))) {
+      buildJar(project, platform, jarFile, classes)
     }
+
     Option.when(Files.exists(jarFile))(jarFile)
   }
 
@@ -202,7 +186,7 @@ object App {
   private def addFilesToJar(root: Path, os: JarOutputStream) =
     Files.walk(root).forEachOrdered { file =>
       val name = root.relativize(file).toString
-      if (name.nonEmpty) {
+      if (name != "bloop-internal-classes" && name.nonEmpty) {
         addJarEntry(os, file, name, Files.isDirectory(file, LinkOption.NOFOLLOW_LINKS))
       }
     }
