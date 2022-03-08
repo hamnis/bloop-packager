@@ -137,7 +137,6 @@ object App {
           .asScala
           .forall(p => p.toString.endsWith("bloop-internal-classes")))
       .getOrElse(project.out.resolve("bloop-bsp-clients-classes").resolve("classes-bloop-cli"))
-    println(classes)
     val resourceLastChange: Option[FileTime] = project.resources
       .getOrElse(Nil)
       .filter(Files.exists(_))
